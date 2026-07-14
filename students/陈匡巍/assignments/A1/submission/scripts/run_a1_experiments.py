@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cs336_basics.adapters_impl import (
     BPETokenizer,
     TransformerLM,
+    get_adamw_cls,
     get_tokenizer,
     run_cross_entropy,
     run_get_batch,
@@ -33,6 +34,24 @@ def write_json(path: Path, data: dict) -> None:
 def train_tokenizer(path: Path, vocab_size: int, special_tokens: list[str]) -> BPETokenizer:
     vocab, merges = run_train_bpe(path, vocab_size, special_tokens)
     return get_tokenizer(vocab, merges, special_tokens)
+
+
+def load_or_train_tokenizer(
+    path: Path,
+    vocab_size: int,
+    special_tokens: list[str],
+    cache_path: Path,
+    *,
+    overwrite: bool,
+) -> BPETokenizer:
+    if cache_path.is_file() and not overwrite:
+        with cache_path.open("rb") as f:
+            return pickle.load(f)
+    tokenizer = train_tokenizer(path, vocab_size, special_tokens)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as f:
+        pickle.dump(tokenizer, f)
+    return tokenizer
 
 
 def tokenizer_stats(tokenizer: BPETokenizer, text: str) -> dict:
@@ -53,6 +72,15 @@ def encode_text(tokenizer: BPETokenizer, text: str) -> np.ndarray:
     vocab_size = len(tokenizer.vocab)
     dtype = np.uint16 if vocab_size <= np.iinfo(np.uint16).max else np.uint32
     return np.array(tokenizer.encode(text), dtype=dtype)
+
+
+def load_or_encode(cache_path: Path, tokenizer: BPETokenizer, text: str, *, overwrite: bool) -> np.ndarray:
+    if cache_path.is_file() and not overwrite:
+        return np.load(cache_path)
+    ids = encode_text(tokenizer, text)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, ids)
+    return ids
 
 
 def evaluate(model: TransformerLM, data: np.ndarray, batch_size: int, context_length: int, device: str, steps: int) -> float:
@@ -97,6 +125,8 @@ def train_run(
     sample_path: Path | None = None,
 ) -> dict:
     torch.manual_seed(20260713)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -109,7 +139,7 @@ def train_run(
         use_rope=use_rope,
         ffn_variant=ffn_variant,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), weight_decay=0.1)
+    optimizer = get_adamw_cls()(model.parameters(), lr=max_lr, betas=(0.9, 0.95), weight_decay=0.1)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
     final_val_loss = None
@@ -135,11 +165,13 @@ def train_run(
                 final_val_loss = evaluate(model, val_data, batch_size, context_length, device, val_batches)
                 record["val_loss"] = final_val_loss
             log_file.write(json.dumps(record) + "\n")
+            log_file.flush()
     total_time = time.time() - start
     summary = {
         "name": name,
         "final_val_loss": final_val_loss,
         "total_train_time_sec": total_time,
+        "processed_tokens": total_steps * batch_size * context_length,
         "config": {
             "vocab_size": vocab_size,
             "context_length": context_length,
@@ -159,11 +191,13 @@ def train_run(
             "device": device,
         },
     }
+    if device.startswith("cuda") and torch.cuda.is_available():
+        summary["peak_memory_gb"] = torch.cuda.max_memory_allocated() / 1024**3
     if sample_tokenizer is not None and sample_path is not None:
         sample = {
             "prompt": "Once upon a time",
             "sample": generate_sample(sample_tokenizer, model, "Once upon a time", device),
-            "note": "Sample generated from the trained TinyStories smoke-run checkpoint kept in memory during this script run.",
+            "note": "Sample generated from the trained TinyStories checkpoint kept in memory during this script run.",
         }
         write_json(sample_path, sample)
         summary["generation_sample_path"] = str(sample_path)
@@ -171,7 +205,7 @@ def train_run(
     return summary
 
 
-def generate_sample(tokenizer: BPETokenizer, model: TransformerLM, prompt: str, device: str, max_new_tokens: int = 96) -> str:
+def generate_sample(tokenizer: BPETokenizer, model: TransformerLM, prompt: str, device: str, max_new_tokens: int = 256) -> str:
     model.eval()
     ids = tokenizer.encode(prompt)
     eos_id = tokenizer.token_to_id.get(b"<|endoftext|>")
@@ -194,61 +228,107 @@ def generate_sample(tokenizer: BPETokenizer, model: TransformerLM, prompt: str, 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=Path("runs/a1_smoke"))
+    parser.add_argument("--output", type=Path, default=Path("runs/a1_experiments"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--tinystories", type=Path, default=Path("tests/fixtures/tinystories_sample_5M.txt"))
     parser.add_argument("--owt", type=Path, default=Path("tests/fixtures/corpus.en"))
     parser.add_argument("--max-chars", type=int, default=5_000_000)
+    parser.add_argument("--tiny-max-chars", type=int)
+    parser.add_argument("--owt-max-chars", type=int)
     parser.add_argument("--tiny-vocab-size", type=int, default=10_000)
     parser.add_argument("--owt-vocab-size", type=int, default=32_000)
+    parser.add_argument("--context-length", type=int, default=64)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-ff", type=int, default=320)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--total-steps", type=int, default=120)
+    parser.add_argument("--max-lr", type=float, default=3e-3)
+    parser.add_argument("--min-lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--val-interval", type=int, default=30)
+    parser.add_argument("--val-batches", type=int, default=4)
+    parser.add_argument("--lr-values", default="0.001,0.003,0.01,0.03,0.1,1.0")
+    parser.add_argument("--lr-sweep-steps", type=int, default=40)
+    parser.add_argument("--batch-sizes", default="1,64,128")
+    parser.add_argument("--batch-sweep-steps", type=int, default=30)
+    parser.add_argument("--ablation-steps", type=int, default=50)
+    parser.add_argument("--owt-steps", type=int)
+    parser.add_argument("--overwrite-cache", action="store_true")
     args = parser.parse_args()
 
     special_tokens = ["<|endoftext|>"]
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
-    tiny_text = args.tinystories.read_text(encoding="utf-8")[: args.max_chars]
-    owt_text = args.owt.read_text(encoding="utf-8")[: args.max_chars]
+    tiny_max_chars = args.tiny_max_chars if args.tiny_max_chars is not None else args.max_chars
+    owt_max_chars = args.owt_max_chars if args.owt_max_chars is not None else args.max_chars
+    tiny_text = args.tinystories.read_text(encoding="utf-8")[:tiny_max_chars]
+    owt_text = args.owt.read_text(encoding="utf-8")[:owt_max_chars]
     tiny_slice = output / "tinystories_slice.txt"
     owt_slice = output / "owt_slice.txt"
     tiny_slice.write_text(tiny_text, encoding="utf-8")
     owt_slice.write_text(owt_text, encoding="utf-8")
 
-    tiny_tokenizer = train_tokenizer(tiny_slice, args.tiny_vocab_size, special_tokens)
-    owt_tokenizer = train_tokenizer(owt_slice, args.owt_vocab_size, special_tokens)
+    tiny_tokenizer = load_or_train_tokenizer(
+        tiny_slice,
+        args.tiny_vocab_size,
+        special_tokens,
+        output / f"tinystories_tokenizer_v{args.tiny_vocab_size}_c{len(tiny_text)}.pkl",
+        overwrite=args.overwrite_cache,
+    )
+    owt_tokenizer = load_or_train_tokenizer(
+        owt_slice,
+        args.owt_vocab_size,
+        special_tokens,
+        output / f"owt_tokenizer_v{args.owt_vocab_size}_c{len(owt_text)}.pkl",
+        overwrite=args.overwrite_cache,
+    )
     stats = {
         "tinystories": tokenizer_stats(tiny_tokenizer, tiny_text[:500_000]),
         "owt": tokenizer_stats(owt_tokenizer, owt_text[:500_000]),
         "slice_chars": {"tinystories": len(tiny_text), "owt": len(owt_text)},
     }
     write_json(output / "tokenizer_stats.json", stats)
-    with (output / "tinystories_tokenizer.pkl").open("wb") as f:
-        pickle.dump(tiny_tokenizer, f)
 
-    tiny_ids = encode_text(tiny_tokenizer, tiny_text)
+    tiny_ids = load_or_encode(
+        output / f"tinystories_ids_v{len(tiny_tokenizer.vocab)}_c{len(tiny_text)}.npy",
+        tiny_tokenizer,
+        tiny_text,
+        overwrite=args.overwrite_cache,
+    )
     split = int(len(tiny_ids) * 0.95)
     train_ids = tiny_ids[:split]
     val_ids = tiny_ids[split:]
-    owt_ids = encode_text(owt_tokenizer, owt_text)
+    owt_ids = load_or_encode(
+        output / f"owt_ids_v{len(owt_tokenizer.vocab)}_c{len(owt_text)}.npy",
+        owt_tokenizer,
+        owt_text,
+        overwrite=args.overwrite_cache,
+    )
     owt_split = max(int(len(owt_ids) * 0.9), 1)
     owt_train = owt_ids[:owt_split]
     owt_val = owt_ids[owt_split:]
 
     base = {
         "vocab_size": len(tiny_tokenizer.vocab),
-        "context_length": 64,
-        "d_model": 128,
-        "d_ff": 320,
-        "num_layers": 2,
-        "num_heads": 4,
-        "batch_size": 64,
-        "total_steps": 120,
-        "max_lr": 3e-3,
-        "min_lr": 3e-4,
-        "warmup_steps": 10,
-        "val_interval": 30,
-        "val_batches": 4,
+        "context_length": args.context_length,
+        "d_model": args.d_model,
+        "d_ff": args.d_ff,
+        "num_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "batch_size": args.batch_size,
+        "total_steps": args.total_steps,
+        "max_lr": args.max_lr,
+        "min_lr": args.min_lr,
+        "warmup_steps": args.warmup_steps,
+        "val_interval": args.val_interval,
+        "val_batches": args.val_batches,
         "device": args.device,
     }
+    def warmup_for(total_steps: int) -> int:
+        return max(1, min(args.warmup_steps, total_steps // 10 if total_steps >= 10 else 1))
+
     summaries: dict[str, dict] = {}
     summaries["tinystories"] = train_run(
         name="tinystories",
@@ -260,9 +340,18 @@ def main() -> None:
         sample_path=output / "generation_sample.json",
         **base,
     )
-    for lr in (1e-3, 1e-2, 1e-1, 1.0, 10.0):
+    lr_values = [float(value) for value in args.lr_values.split(",") if value.strip()]
+    for lr in lr_values:
         cfg = dict(base)
-        cfg.update({"total_steps": 40, "max_lr": lr, "min_lr": lr * 0.1, "batch_size": 32, "val_interval": 20})
+        cfg.update(
+            {
+                "total_steps": args.lr_sweep_steps,
+                "max_lr": lr,
+                "min_lr": lr * 0.1,
+                "warmup_steps": warmup_for(args.lr_sweep_steps),
+                "val_interval": max(1, args.lr_sweep_steps // 4),
+            }
+        )
         summaries[f"lr_{lr:g}"] = train_run(
             name=f"lr_{lr:g}",
             train_data=train_ids,
@@ -271,17 +360,55 @@ def main() -> None:
             summary_path=output / "lr_sweep" / f"summary_lr_{lr:g}.json",
             **cfg,
         )
-    for batch_size in (1, 64, 128):
+    batch_sizes = [int(value) for value in args.batch_sizes.split(",") if value.strip()]
+    for batch_size in batch_sizes:
         cfg = dict(base)
-        cfg.update({"total_steps": 30, "batch_size": batch_size, "val_interval": 15})
-        summaries[f"batch_{batch_size}"] = train_run(
-            name=f"batch_{batch_size}",
-            train_data=train_ids,
-            val_data=val_ids,
-            log_path=output / "batch_size" / f"batch_{batch_size}.jsonl",
-            summary_path=output / "batch_size" / f"summary_batch_{batch_size}.json",
-            **cfg,
+        cfg.update(
+            {
+                "total_steps": args.batch_sweep_steps,
+                "batch_size": batch_size,
+                "warmup_steps": warmup_for(args.batch_sweep_steps),
+                "val_interval": max(1, args.batch_sweep_steps // 2),
+            }
         )
+        try:
+            summaries[f"batch_{batch_size}"] = train_run(
+                name=f"batch_{batch_size}",
+                train_data=train_ids,
+                val_data=val_ids,
+                log_path=output / "batch_size" / f"batch_{batch_size}.jsonl",
+                summary_path=output / "batch_size" / f"summary_batch_{batch_size}.json",
+                **cfg,
+            )
+        except torch.OutOfMemoryError as error:
+            if args.device.startswith("cuda") and torch.cuda.is_available():
+                peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
+                torch.cuda.empty_cache()
+            else:
+                peak_memory_gb = None
+            summary = {
+                "name": f"batch_{batch_size}",
+                "status": "oom",
+                "error": str(error).splitlines()[0],
+                "processed_tokens": 0,
+                "peak_memory_gb": peak_memory_gb,
+                "config": {
+                    "vocab_size": cfg["vocab_size"],
+                    "context_length": cfg["context_length"],
+                    "d_model": cfg["d_model"],
+                    "d_ff": cfg["d_ff"],
+                    "num_layers": cfg["num_layers"],
+                    "num_heads": cfg["num_heads"],
+                    "batch_size": cfg["batch_size"],
+                    "total_steps": cfg["total_steps"],
+                    "max_lr": cfg["max_lr"],
+                    "min_lr": cfg["min_lr"],
+                    "warmup_steps": cfg["warmup_steps"],
+                    "device": cfg["device"],
+                },
+            }
+            write_json(output / "batch_size" / f"summary_batch_{batch_size}.json", summary)
+            summaries[f"batch_{batch_size}"] = summary
     ablations = {
         "no_rmsnorm": {"use_rmsnorm": False},
         "post_norm": {"norm_position": "post"},
@@ -290,7 +417,15 @@ def main() -> None:
     }
     for name, changes in ablations.items():
         cfg = dict(base)
-        cfg.update({"total_steps": 50, "batch_size": 32, "val_interval": 25})
+        cfg.update(
+            {
+                "total_steps": args.ablation_steps,
+                "warmup_steps": warmup_for(args.ablation_steps),
+                "val_interval": max(1, args.ablation_steps // 5),
+            }
+        )
+        if name == "silu_ffn":
+            cfg["d_ff"] = int(round(base["d_ff"] * 1.5))
         cfg.update(changes)
         summaries[name] = train_run(
             name=name,
@@ -301,7 +436,7 @@ def main() -> None:
             **cfg,
         )
     owt_cfg = dict(base)
-    owt_cfg.update({"vocab_size": len(owt_tokenizer.vocab), "total_steps": 60, "batch_size": 32, "val_interval": 20})
+    owt_cfg.update({"vocab_size": len(owt_tokenizer.vocab), "total_steps": args.owt_steps or args.total_steps})
     summaries["owt"] = train_run(
         name="owt",
         train_data=owt_train,

@@ -1,20 +1,20 @@
 {
   "tinystories": {
     "num_bytes": 500170,
-    "num_tokens": 157181,
-    "compression_ratio_bytes_per_token": 3.18212761084355,
-    "longest_token_bytes": 13,
-    "throughput_bytes_per_sec": 537693.6562881013
+    "num_tokens": 121542,
+    "compression_ratio_bytes_per_token": 4.115202975103257,
+    "longest_token_bytes": 15,
+    "throughput_bytes_per_sec": 459320.68967344315
   },
   "owt": {
     "num_bytes": 503943,
-    "num_tokens": 213107,
-    "compression_ratio_bytes_per_token": 2.3647416556002385,
-    "longest_token_bytes": 13,
-    "throughput_bytes_per_sec": 518302.9296186605
+    "num_tokens": 109652,
+    "compression_ratio_bytes_per_token": 4.59583956516981,
+    "longest_token_bytes": 142,
+    "throughput_bytes_per_sec": 393912.53313236
   },
   "slice_chars": {
-    "tinystories": 5000000,
+    "tinystories": 22493387,
     "owt": 5000000
   }
 }

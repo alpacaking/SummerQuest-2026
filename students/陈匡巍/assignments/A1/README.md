@@ -7,9 +7,10 @@
 - 作业题面版本：26.0.4
 - 上游 starter commit：`a158843b20107949f1a8d7df1b05cd33b9166712`
 - 本地工作仓库：`../assignment1-basics`，与 `SummerQuest-2026` 同级
-- 完成范围：21 个 adapter 接口对应实现、官方测试、BPE/tokenizer、Transformer LM、训练工具、checkpoint、训练/生成脚本，以及一组公开数据切片 smoke-run 日志
-- 未完成项：未完成题面建议的 TinyStories 10K tokenizer + 10,000 step baseline、OWT 32K tokenizer 全量训练和长时间消融；本报告中的实验结果只作为小规模功能验证和趋势观察
 - 官方测试：`python3 -m pytest -q`，结果为 `47 passed, 1 xpassed`
+- 实验设备：`PPU-ZW810`，单卡 96GB，经 PyTorch `cuda` backend 使用
+
+本次提交覆盖 21 个 adapter 接口的 from-scratch 实现、BPE tokenizer、Transformer LM、AdamW、训练/验证/生成脚本，以及 TinyStories、学习率、batch size、四个架构消融和 OWT 的实验日志。TinyStories baseline 采用题面允许的低资源预算：`49.15M` processed tokens，最终 validation loss 为 `1.9760`。
 
 评分标准与评测方式见 [A1 EVALUATION](../../../../assignments/A1/EVALUATION.md)；日志格式见 [A1 题面《实验日志格式》](../../../../assignments/A1/README.md#实验日志格式)。
 
@@ -31,9 +32,13 @@ AdamW 对每个参数维护参数本身、梯度、一阶矩 `m` 和二阶矩 `v
 parameter 4 bytes + gradient 4 bytes + m 4 bytes + v 4 bytes = 16 bytes / parameter
 ```
 
-实际训练还会有激活、临时 buffer、框架状态和可能的 master weights，因此峰值显存会高于这个下界。一次 AdamW 更新主要是逐元素的 weight decay、两个动量更新、bias correction、sqrt/divide 和参数更新；可粗略按十余次 elementwise FLOPs/parameter 估计，通常远小于 Transformer forward/backward 的矩阵乘法成本。
+实际峰值还包括激活、临时 buffer、框架状态和可能的 master weights。本次 TinyStories baseline 配置为 `d_model=512`、4 层、16 头、context length 256、batch size 128、1500 step，共处理：
 
-本次 smoke-run TinyStories 配置为 `d_model=128`、2 层、4 头、context length 64、batch size 64、120 step，共处理约 `120 * 64 * 64 = 491,520` 个 token，训练耗时约 5.05 秒。该吞吐只用于验证训练 loop 和日志记录，不能直接外推到题面 baseline 的 512 维、4 层、context 256、10,000 step 目标。
+```text
+1500 * 128 * 256 = 49,152,000 tokens
+```
+
+训练耗时 `250.84s`，峰值显存约 `15.23GB`。AdamW 单次更新主要由 weight decay、两个动量更新、bias correction、sqrt/divide 和参数更新组成，粗略为十余次 elementwise FLOPs/parameter；相对 Transformer forward/backward 的矩阵乘法成本较小。
 
 ## 实现说明
 
@@ -43,68 +48,113 @@ parameter 4 bytes + gradient 4 bytes + m 4 bytes + v 4 bytes = 16 bytes / parame
 - `Linear`、`Embedding`、`RMSNorm`、`SiLU`、`SwiGLU`
 - RoPE、masked scaled dot-product attention、causal multi-head self-attention
 - Pre-Norm Transformer block 和完整 decoder-only Transformer LM
-- stable softmax、cross-entropy、global gradient clipping、cosine schedule、AdamW、checkpoint save/load
+- stable softmax、cross-entropy、global gradient clipping、cosine schedule、自写 AdamW、checkpoint save/load
 - 可配置训练/消融/生成脚本：`submission/scripts/run_a1_experiments.py`
 
-BPE 训练使用 pair count 与受影响 pre-token 的增量更新，避免每轮全量复制所有 token 序列；官方 `test_train_bpe_speed` 和正确性测试均通过。
+BPE 训练使用 pair count 与受影响 pre-token 的增量更新，避免每轮全量复制所有 token 序列；官方 `test_train_bpe_speed` 和正确性测试均通过。实验脚本中的训练 optimizer 也使用 `get_adamw_cls()` 返回的自写 AdamW，而不是 `torch.optim.AdamW`。
 
 ## 实验设置
 
-实验脚本使用公开数据源的固定前缀切片：
+数据使用公开文件的固定切片，并在各文件内部做 train/validation split：
 
-- TinyStories：`TinyStoriesV2-GPT4-valid.txt` 前 5,000,000 字符
-- OWT：`owt_valid.txt` 前 5,000,000 字符
+- TinyStories：`TinyStoriesV2-GPT4-valid.txt` 全部可用文本，`22,493,387` 字符
+- OWT：`owt_valid.txt` 前 `5,000,000` 字符
 
-本次提交的 smoke-run 为节省时间使用较小配置：
+主要模型配置：
 
 ```text
-TinyStories vocab size: 1000
-OWT vocab size: 800
-context length: 64
-d_model: 128
-d_ff: 320
-layers / heads: 2 / 4
-device: CUDA-compatible accelerator
+TinyStories vocab size: 10,000
+OWT vocab size: 32,000
+context length: 256
+d_model: 512
+d_ff: 1,344
+layers / heads: 4 / 16
+RoPE theta: 10,000
+baseline batch size: 128
+baseline steps: 1,500
 ```
 
-我也尝试启动 10K/32K 词表切片实验，但 OWT 32K BPE 预处理时间明显变长，未纳入本次提交日志。提交的日志不包含原始数据、checkpoint、模型权重或内部路径。
+`logs/` 中不包含原始数据、tokenizer pickle、NumPy token ids、checkpoint、模型权重或内部路径。
 
 ## Tokenizer 实验
 
-| 数据 | bytes | tokens | compression ratio | longest token | throughput |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TinyStories 切片评估 | 500,170 | 157,181 | 3.18 bytes/token | 13 bytes | 537,694 bytes/s |
-| OWT 切片评估 | 503,943 | 213,107 | 2.36 bytes/token | 13 bytes | 518,303 bytes/s |
+| 数据 | 训练切片 | bytes | tokens | compression ratio | longest token | throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TinyStories 10K | 22,493,387 chars | 500,170 | 121,542 | 4.12 bytes/token | 15 bytes | 459,321 bytes/s |
+| OWT 32K | 5,000,000 chars | 503,943 | 109,652 | 4.60 bytes/token | 142 bytes | 393,913 bytes/s |
 
-TinyStories 的压缩率高于 OWT，符合预期：儿童故事语料重复模式和短语结构更集中，BPE 更容易把常见片段合并成较长 token。OWT 文本风格更杂，单位 token 覆盖的 byte 数更少。
+OWT 的词表更大，因此在 500K 字符评估片段上压缩率高于 TinyStories；同时 OWT 的最长 token 明显更长，说明网页文本中存在较长重复片段、URL/标点组合或格式片段。TinyStories 语体更规整，但 10K 词表上最长 token 更短。
 
-## 训练与消融结果
+## TinyStories Baseline
 
 ![Loss curves](assets/loss_curves.svg)
 
-| run | step | batch | final val loss | train time |
-| --- | ---: | ---: | ---: | ---: |
-| TinyStories smoke | 120 | 64 | 3.5880 | 5.05s |
-| OWT smoke | 60 | 32 | 5.7225 | 0.47s |
-| LR 0.001 | 40 | 32 | 5.6344 | 0.32s |
-| LR 0.01 | 40 | 32 | 5.3986 | 0.32s |
-| LR 0.1 | 40 | 32 | 5.6617 | 0.32s |
-| LR 1.0 | 40 | 32 | 5.8517 | 0.32s |
-| batch 1 | 30 | 1 | 5.7276 | 0.24s |
-| batch 64 | 30 | 64 | 5.2212 | 0.25s |
-| batch 128 | 30 | 128 | 5.1379 | 0.26s |
-| no RMSNorm | 50 | 32 | 5.7427 | 0.33s |
-| Post-Norm | 50 | 32 | 4.1001 | 0.39s |
-| NoPE | 50 | 32 | 4.7307 | 0.30s |
-| SiLU FFN | 50 | 32 | 4.6472 | 0.38s |
+| metric | value |
+| --- | ---: |
+| processed tokens | 49,152,000 |
+| final train loss | 1.1525 |
+| final validation loss | 1.9760 |
+| best recorded validation loss | 1.9491 |
+| train time | 250.84s |
+| peak memory | 15.23GB |
 
-分析：
+该 run 使用约 49M tokens，超过题面低资源方案的约 40M tokens 参考线；最终 validation loss `1.9760` 低于低资源目标 `2.00`。训练曲线从 step 150 的 val loss `2.9308` 降到 step 1050 的 `1.9491`，后续在 `1.97-2.00` 附近波动，说明继续训练收益开始变小。
 
-- TinyStories smoke-run 的 train loss 从约 6.93 降到 3.57，说明训练 loop、反向传播、优化器、验证和日志记录都能正常工作。
-- 在短 run 中，batch size 64/128 的验证损失低于 batch size 1，主要因为每步看到的 token 数更多，梯度估计更稳定。
-- LR sweep 中 `0.01` 在 40 step 内最好；`0.1` 和 `1.0` 明显变差，可作为高学习率不稳定的短 run 证据，但还没有长到出现 NaN 发散。
-- 消融结果来自很短训练，不能作为架构优劣的最终结论。No RMSNorm 明显较差；Post-Norm、NoPE、SiLU FFN 在这个小规模设置下并未恶化到不可训练，说明需要更长训练和统一 token budget 才能做可靠判断。
-- OWT smoke-run 的 validation loss 高于 TinyStories，符合更杂语料和更小 OWT tokenizer 设置下训练更难的预期。
+## Learning Rate Sweep
+
+| max LR | processed tokens | final val loss | 结论 |
+| ---: | ---: | ---: | --- |
+| 0.0003 | 9,830,400 | 2.8774 | 偏保守，下降较慢 |
+| 0.001 | 9,830,400 | 2.5664 | 短 run 最好，选作 baseline |
+| 0.003 | 9,830,400 | 2.6323 | 接近但略差 |
+| 0.01 | 9,830,400 | 3.2085 | 明显变差 |
+| 0.03 | 9,830,400 | 3.7990 | 不稳定 |
+| 0.1 | 9,830,400 | 3.9434 | 不稳定 |
+| 1.0 | 9,830,400 | 6.5496 | 发散 |
+| 10.0 | 9,830,400 | 69.0468 | 严重发散 |
+
+`0.001` 在 300-step sweep 中最好，因此 baseline 使用 `max_lr=0.001`。`10.0` 的 train loss 在后期达到几十到上百，validation loss 为 `69.0468`，满足“至少一个发散 run”的要求。
+
+## Batch Size Sweep
+
+| batch size | processed tokens | final val loss | peak memory | 结论 |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 25,600 | 5.0803 | 0.48GB | 每步 token 太少，噪声大 |
+| 64 | 1,638,400 | 3.8727 | 7.80GB | 可稳定训练 |
+| 128 | 3,276,800 | 3.8269 | 15.24GB | baseline batch |
+| 256 | 6,553,600 | 3.6383 | 30.11GB | 更稳定 |
+| 512 | 13,107,200 | 3.5793 | 59.87GB | 本设备稳定上限 |
+| 768 | 196,608 before failure | OOM | >89GB observed | 完整 loop 中 OOM |
+
+在固定 100 step 下，较大 batch 因每步处理 token 更多，validation loss 更低。`768` 在单步探测中接近 90GB，完整训练/验证阶段触发 OOM，因此本设备上可复现的稳定上限按 `512` 记录。
+
+## 架构消融
+
+所有消融使用 TinyStories、同一 tokenizer 和同一模型主配置，训练 `750` step、`24.58M` processed tokens。SiLU FFN 使用 `d_ff=2016`，使实际参与计算的 FFN 矩阵规模与 SwiGLU 近似匹配。
+
+| run | final val loss | 观察 |
+| --- | ---: | --- |
+| baseline 750-step checkpoint | 1.9874 | 对照点来自主训练 step 750 |
+| no RMSNorm | 2.5874 | 明显退化，训练更慢 |
+| Post-Norm | 1.9763 | 该预算下与 Pre-Norm 接近 |
+| NoPE | 2.1196 | 退化，说明位置信息有帮助 |
+| SiLU FFN | 2.0968 | 退化，SwiGLU 在本设置下更优 |
+
+No RMSNorm 是影响最大的消融；NoPE 和 SiLU FFN 均比 baseline 差。Post-Norm 在这个低资源预算里没有显著变差，可能与模型较小、训练步数有限和验证噪声有关，不能据此推出 Post-Norm 在更长训练中优于 Pre-Norm。
+
+## OWT 训练
+
+OWT 使用 `32K` tokenizer，并使用与 TinyStories baseline 相同的模型架构、batch size 和 `1500` training iterations。
+
+| metric | value |
+| --- | ---: |
+| processed tokens | 49,152,000 |
+| final train loss | 0.1524 |
+| final validation loss | 9.7634 |
+| train time | 329.45s |
+| peak memory | 26.31GB |
+
+OWT 的 validation loss 在 step 300 降到 `6.1401` 后开始上升，最终达到 `9.7634`，而 train loss 持续下降到 `0.1524`。这说明在仅 5M 字符 OWT 切片上，32K tokenizer 使 token 序列较短，1500 steps 反复采样后很快过拟合训练 split。这个结果也说明 OWT 比 TinyStories 更需要更大的训练语料或更强正则/更短训练预算。
 
 ## 文本生成样本
 
@@ -117,46 +167,62 @@ Once upon a time
 Sample：
 
 ```text
-Once upon a time, there was a popy plime. She took a big ball, and her and soft tellove used for a big a big box. The little boy named Max.
-The girl was very happy to the bird.
+Once upon a time, there was a humble cat named Tom. Tom loved to play with his hoop. He would roll it around the garden and watch it roll on the ground. Tom's friends, a dog named Max, saw him playing with the hoop.
+One day, Tom was playing with the hoop in the garden. He kicked it high into the air and it moved! Tom was sad and confused. He didn't know what to do.
+Just then, a big gust of wind came through the window. It was a magic kick! Tom and Max ran after the ball and found it near a big tree. They were so happy! Tom learned that even when things go by, it's good to listen to them.
 <|endoftext|>
 ```
 
-简评：样本有 TinyStories 风格的人名、简单句和故事结构，但也出现了拼写错误、重复短语和不连贯动作。这符合 120 step 小模型 smoke-run 的预期：模型已学到部分局部格式，但远未达到稳定生成。
+简评：样本具有 TinyStories 风格的人物、物品、简单冲突和结尾，语法基本通顺；仍存在因果关系不稳的问题，例如 “magic kick” 和最后一句的含义不够自然。影响生成质量的主要因素包括训练 token 数、模型规模、采样温度/top-p，以及 TinyStories 数据本身偏短篇童话的分布。
 
 ## 复现说明
 
-- 环境与依赖：Python 3.12，PyTorch，NumPy，regex，tiktoken，pytest，jaxtyping；官方依赖以 `../assignment1-basics/pyproject.toml` 和 `uv.lock` 为准
-- 数据准备：按 Stanford starter README 下载 TinyStories 与 OWT sample；本次 smoke-run 使用公开 validation 文件的固定前缀切片
-- 官方测试命令：
+官方测试命令：
 
 ```bash
 cd ../assignment1-basics
 python3 -m pytest -q
 ```
 
-- smoke-run 命令：
+实验命令：
 
 ```bash
 cd ../assignment1-basics
 python3 scripts/run_a1_experiments.py \
-  --output runs/a1_public_valid \
+  --output runs/a1_formal \
   --device cuda \
   --tinystories data/TinyStoriesV2-GPT4-valid.txt \
   --owt data/owt_valid.txt \
-  --max-chars 5000000 \
-  --tiny-vocab-size 1000 \
-  --owt-vocab-size 800
+  --tiny-max-chars 50000000 \
+  --owt-max-chars 5000000 \
+  --tiny-vocab-size 10000 \
+  --owt-vocab-size 32000 \
+  --context-length 256 \
+  --d-model 512 \
+  --d-ff 1344 \
+  --num-layers 4 \
+  --num-heads 16 \
+  --batch-size 128 \
+  --total-steps 1500 \
+  --max-lr 0.001 \
+  --min-lr 0.0001 \
+  --warmup-steps 150 \
+  --val-interval 150 \
+  --val-batches 8 \
+  --lr-values 0.0003,0.001,0.003,0.01,0.03,0.1,1.0,10.0 \
+  --lr-sweep-steps 300 \
+  --batch-sizes 1,64,128,256,512,768 \
+  --batch-sweep-steps 100 \
+  --ablation-steps 750 \
+  --owt-steps 1500
 ```
 
-- 同步命令：
+同步命令：
 
 ```bash
 cd ../SummerQuest-2026
 python3 scripts/sync_a1_submission.py --name '陈匡巍'
 ```
-
-- 配置文件：无单独配置文件；公开配置记录在 `logs/summary.json` 和各 `summary_*.json` 中
 
 ## 实验日志
 
@@ -169,7 +235,7 @@ python3 scripts/sync_a1_submission.py --name '陈匡巍'
 - OWT：`logs/train_owt.jsonl`、`logs/summary_owt.json`
 - 文本生成：`logs/generation_sample.json`
 
-JSONL 中逐点记录 `step`、`wall_clock_sec`、`train_loss`、`lr`，并在验证点记录 `val_loss`；summary 文件记录最终 validation loss、训练时间和关键配置。
+JSONL 中逐点记录 `step`、`wall_clock_sec`、`train_loss`、`lr`，并在验证点记录 `val_loss`；summary 文件记录最终 validation loss、训练时间、processed tokens、峰值显存和关键配置。
 
 ## 飞书补充文档
 

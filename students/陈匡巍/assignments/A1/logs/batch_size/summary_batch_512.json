@@ -1,8 +1,8 @@
 {
-  "name": "batch_128",
-  "final_val_loss": 3.8269080221652985,
-  "total_train_time_sec": 17.387250900268555,
-  "processed_tokens": 3276800,
+  "name": "batch_512",
+  "final_val_loss": 3.5792930722236633,
+  "total_train_time_sec": 67.083487033844,
+  "processed_tokens": 13107200,
   "config": {
     "vocab_size": 10000,
     "context_length": 256,
@@ -10,7 +10,7 @@
     "d_ff": 1344,
     "num_layers": 4,
     "num_heads": 16,
-    "batch_size": 128,
+    "batch_size": 512,
     "total_steps": 100,
     "max_lr": 0.001,
     "min_lr": 0.0001,
@@ -21,5 +21,5 @@
     "ffn_variant": "swiglu",
     "device": "cuda"
   },
-  "peak_memory_gb": 15.236702919006348
+  "peak_memory_gb": 59.86588478088379
 }
